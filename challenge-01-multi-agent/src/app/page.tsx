@@ -183,7 +183,7 @@ export default function CanvasPage() {
   };
   const toTrace = (run: RunRecord): RunTraceView  => {
     return {
-      id: `run-${run.runId}`,     
+      id: `MultiMock-${run.runId}`,     
       mode: "multi-agent-mock",
       status: run.status,
       events: run.events,

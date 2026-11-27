@@ -1,7 +1,6 @@
 import { type RunRecord } from "./types.ts";
 
 export interface RunStore {
-  createRun(r: RunRecord): Promise<void>;
   getRun(runId: number): Promise<RunRecord | null>;
   saveRun(r: RunRecord): Promise<void>;
 }
@@ -10,11 +9,6 @@ export interface RunStore {
 
 export class LocalRunStore implements RunStore {
   static runIdListKey = "mindverse:runtime:runIdList";
-
-  async createRun(r: RunRecord): Promise<void> {
-    this.saveRunIdList(r.runId);
-    localStorage.setItem(this.runKey(r.runId), JSON.stringify(r));
-  }
 
   async getRunIdList(): Promise<number[]>{
     const runIdList = localStorage.getItem(LocalRunStore.runIdListKey);
