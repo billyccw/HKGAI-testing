@@ -13,15 +13,22 @@ import {
 } from "lucide-react";
 import { initialSnapshot, parseSnapshot, type CanvasNode, type CanvasSnapshot } from "../core/canvas.ts";
 import { runMockAgent, type MockAgentTrace } from "../core/mockAgent.ts";
+import { runMultiMockAgent } from "../core/multiAgents.ts";
+import { LocalRunStore } from "../core/runtime/store.ts";
+import { type RunRecord, type RunTraceView} from "../core/runtime/types.ts";
 
 type EditorNode = Node<CanvasNode["data"], "creative">;
 type EditorEdge = Edge;
+type AgentMode = "single" | "multi";
 
 const storageKey = "mindverse-challenge:canvas:v1";
 const themeKey = "mindverse-challenge:theme";
+const agentKey = "mindverse-challenge:canvas:v1:agent";
+const store = new LocalRunStore();
 const nodeLabels = { text: "文本", image: "图像", video: "视频", reference: "参考" };
 const statusLabels = { idle: "未执行", running: "运行中", waiting: "等待中", success: "已完成", error: "失败" };
 const phaseLabels = { received: "接收", planning: "整理", tooling: "工具", validating: "校验", completed: "完成", blocked: "阻塞" };
+const runStatusLabels = { running: "执行中", completed: "已完成", blocked: "已阻塞", cancelled: "已取消",} as const;
 const starter = structuredClone(initialSnapshot);
 starter.projectName = "未命名创意项目";
 starter.nodes[0].data = { ...starter.nodes[0].data, title: "创意简报", textContent: "安静的摄影棚，同一主体，三个机位。保持场景与主体一致。" };
@@ -62,6 +69,8 @@ export default function CanvasPage() {
   const fileInput = useRef<HTMLInputElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runSequence = useRef(0);
+  const [agentMode, setAgentMode] = useState<AgentMode>("single");
+  const [multiTrace, setMultiTrace] = useState<RunTraceView | null>(null);
 
   useEffect(() => {
     try {
@@ -69,6 +78,19 @@ export default function CanvasPage() {
       const next = saved === "dark" ? "dark" : "light";
       setTheme(next);
       document.documentElement.dataset.theme = next;
+      // 开局读取过往的agent是单还是多
+      const savedAgent = localStorage.getItem(agentKey);
+      const nextAgent = savedAgent === "multi" ? "multi" : "single";
+      if (nextAgent == "multi") setInstruction("将创意简报拆开成三个机位");
+      setAgentMode(nextAgent);
+      // 开局读取run id，如果有run过就还原最后一次的run 的trace
+      (async () => {
+        const lastRunId = await store.getLastRunId();
+        if (lastRunId) {
+          const run = await store.getRun(lastRunId);
+          setMultiTrace(run ? (toTrace(run)) : null);
+        }
+      })();
     } catch { setNotice("浏览器存储不可用，仍可导出 JSON"); }
     return () => { if (timer.current) clearTimeout(timer.current); };
   }, []);
@@ -119,6 +141,12 @@ export default function CanvasPage() {
     setTheme(next); document.documentElement.dataset.theme = next;
     act(() => localStorage.setItem(themeKey, next));
   };
+  const toggleAgent = () => {
+    const next = agentMode === "single" ? "multi" : "single";
+    setAgentMode(next); 
+    setInstruction(next === "multi" ? "将创意简报拆开成三个机位": "整理当前画布，列出创意简报和参考素材。");
+    act(() => localStorage.setItem(agentKey, next));
+  };
   const run = () => {
     if (busy) return;
     const result = runMockAgent({ runId: `mock-${++runSequence.current}`, instruction, snapshot: { version: 1, projectName, nodes, edges }, simulateFailure });
@@ -127,7 +155,40 @@ export default function CanvasPage() {
   };
   const cancel = () => {
     if (timer.current) clearTimeout(timer.current);
-    timer.current = null; setBusy(false); setNotice("已停止本次模拟展示");
+    timer.current = null;
+    setBusy(false);
+    setNotice(agentMode === "single" ? "已停止本次模拟展示" : "已停止本次多 Agent 模拟展示");
+  };
+  const runMulti = async () => {
+    if (busy) return;
+    setMultiTrace(null);
+    setBusy(true);
+    try {
+      const lastRunId = await store.getLastRunId();
+      const result = await runMultiMockAgent({
+        runId: lastRunId ? lastRunId + 1 : 1,
+        instruction,
+        snapshot: { version: 1, projectName, nodes, edges },
+        simulateFailure,
+      });
+      timer.current = setTimeout(() => {
+        setMultiTrace(toTrace(result));
+        setBusy(false);
+        timer.current = null;
+      }, 350);
+    } catch {
+      setBusy(false);
+      setNotice("多 Agent 模拟失败");
+    }
+  };
+  const toTrace = (run: RunRecord): RunTraceView  => {
+    return {
+      id: `run-${run.runId}`,     
+      mode: "multi-agent-mock",
+      status: run.status,
+      events: run.events,
+      ...(run.output ? { output: run.output } : {}),
+    };
   };
 
   return (
@@ -144,6 +205,7 @@ export default function CanvasPage() {
           <button className="icon-button" title="导出 JSON" aria-label="导出 JSON" onClick={exportJson}><ArrowDownToLine size={17} /></button>
           <button className="icon-button" title="导入 JSON" aria-label="导入 JSON" onClick={() => fileInput.current?.click()}><ArrowUpFromLine size={17} /></button>
           <button className="icon-button" title={theme === "light" ? "切换深色主题" : "切换浅色主题"} aria-label={theme === "light" ? "切换深色主题" : "切换浅色主题"} onClick={toggleTheme}>{theme === "light" ? <Moon size={17} /> : <Sun size={17} />}</button>
+          <button className="icon-button" disabled={busy} title={busy ? "任务执行中，请待结束再切换" : agentMode === "single" ? "切换到多 Agent" : "切换到单 Agent"} aria-label={agentMode === "single" ? "切换到多 Agent" : "切换到单 Agent"} onClick={toggleAgent}>{agentMode === "single" ? "单" : "多"}</button>
         </div>
         <input ref={fileInput} hidden type="file" accept=".json,application/json" onChange={(event) => { void importJson(event.target.files?.[0]); event.target.value = ""; }} />
       </header>
@@ -158,28 +220,53 @@ export default function CanvasPage() {
           <div className="canvas-status"><span>{nodes.length} 个节点 · {edges.length} 条连接</span><span role="status">{notice}</span></div>
         </section>
 
-        <aside className="agent-panel" aria-label="Agent 任务面板">
-          <header className="panel-heading"><Bot size={19} /><h1>Agent</h1><span className="mode-badge">单 Agent · Mock</span></header>
-          <div className="agent-scroll">
-            <div className="session-heading"><span className="tiny-dot" />本地任务会话</div>
-            <h2>画布整理助手</h2>
-            <div className="runtime-facts"><span>模型 <b>未连接</b></span><span>工具 <b>本地模拟</b></span></div>
-            {!trace && !busy && <div className="empty-run"><Layers3 size={32} strokeWidth={1} /><span>暂无运行记录</span></div>}
-            {busy && <div className="running-state" role="status"><LoaderCircle size={18} className="spinning" />正在执行本地模拟…</div>}
-            {trace && <section className="run-record" aria-label="运行记录">
-              <div className="run-summary"><span>{trace.id}</span><strong className={trace.status === "blocked" ? "error-text" : ""}>{trace.status === "completed" ? "已完成" : "已阻塞"}</strong></div>
-              <ol className="event-list">{trace.events.map((event) => <li key={event.id}>
-                <span className={`event-icon ${event.kind === "error" ? "error-text" : ""}`}>{event.kind === "error" ? <CircleAlert size={14} /> : <Check size={14} />}</span>
-                <div><span className="event-phase">{phaseLabels[event.phase]}</span><p>{event.message}</p>{event.metadata?.tool && <code>{String(event.metadata.tool)}</code>}</div>
-              </li>)}</ol>
-              {trace.output && <div className="agent-output"><div><FileText size={14} />运行结果</div><p>{trace.output}</p></div>}
-            </section>}
-          </div>
-          <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); run(); }}>
-            <label className="failure-toggle"><input type="checkbox" checked={simulateFailure} disabled={busy} onChange={(event) => setSimulateFailure(event.target.checked)} />模拟工具失败</label>
-            <div className="composer-field"><textarea aria-label="任务指令" placeholder="输入任务…" value={instruction} maxLength={2000} disabled={busy} onChange={(event) => setInstruction(event.target.value)} /><div className="composer-footer"><span>{instruction.length} / 2000</span>{busy ? <button className="send-button" type="button" title="停止本次模拟" aria-label="停止本次模拟" onClick={cancel}><X size={16} /></button> : <button className="send-button" type="submit" title="运行单 Agent 模拟" aria-label="运行单 Agent 模拟" disabled={!instruction.trim()}><Send size={16} /></button>}</div></div>
-          </form>
-        </aside>
+        {agentMode === "single" ? (
+          <aside className="agent-panel" aria-label="Agent 任务面板">
+            <header className="panel-heading"><Bot size={19} /><h1>Agent</h1><span className="mode-badge">单 Agent · Mock</span></header>
+            <div className="agent-scroll">
+              <div className="session-heading"><span className="tiny-dot" />本地任务会话</div>
+              <h2>画布整理助手</h2>
+              <div className="runtime-facts"><span>模型 <b>未连接</b></span><span>工具 <b>本地模拟</b></span></div>
+              {!trace && !busy && <div className="empty-run"><Layers3 size={32} strokeWidth={1} /><span>暂无运行记录</span></div>}
+              {busy && <div className="running-state" role="status"><LoaderCircle size={18} className="spinning" />正在执行本地模拟…</div>}
+              {trace && <section className="run-record" aria-label="运行记录">
+                <div className="run-summary"><span>{trace.id}</span><strong className={trace.status === "blocked" ? "error-text" : ""}>{trace.status === "completed" ? "已完成" : "已阻塞"}</strong></div>
+                <ol className="event-list">{trace.events.map((event) => <li key={event.id}>
+                  <span className={`event-icon ${event.kind === "error" ? "error-text" : ""}`}>{event.kind === "error" ? <CircleAlert size={14} /> : <Check size={14} />}</span>
+                  <div><span className="event-phase">{phaseLabels[event.phase]}</span><p>{event.message}</p>{event.metadata?.tool && <code>{String(event.metadata.tool)}</code>}</div>
+                </li>)}</ol>
+                {trace.output && <div className="agent-output"><div><FileText size={14} />运行结果</div><p>{trace.output}</p></div>}
+              </section>}
+            </div>
+            <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); run(); }}>
+              <label className="failure-toggle"><input type="checkbox" checked={simulateFailure} disabled={busy} onChange={(event) => setSimulateFailure(event.target.checked)} />模拟工具失败</label>
+              <div className="composer-field"><textarea aria-label="任务指令" placeholder="输入任务…" value={instruction} maxLength={2000} disabled={busy} onChange={(event) => setInstruction(event.target.value)} /><div className="composer-footer"><span>{instruction.length} / 2000</span>{busy ? <button className="send-button" type="button" title="停止本次模拟" aria-label="停止本次模拟" onClick={cancel}><X size={16} /></button> : <button className="send-button" type="submit" title="运行单 Agent 模拟" aria-label="运行单 Agent 模拟" disabled={!instruction.trim()}><Send size={16} /></button>}</div></div>
+            </form>
+          </aside>
+        ) : (
+          <aside className="agent-panel" aria-label="多 Agent 任务面板">
+            <header className="panel-heading"><Bot size={19} /><h1>Agent</h1><span className="mode-badge">多 Agent · Mock</span></header>
+            <div className="agent-scroll">
+              <div className="session-heading"><span className="tiny-dot" />本地任务会话</div>
+              <h2>多Agent画布拆分助手</h2>
+              <div className="runtime-facts"><span>模型 <b>未连接</b></span><span>工具 <b>本地模拟</b></span></div>
+              {!multiTrace && !busy && <div className="empty-run"><Layers3 size={32} strokeWidth={1} /><span>暂无运行记录</span></div>}
+              {busy && <div className="running-state" role="status"><LoaderCircle size={18} className="spinning" />正在执行多 Agent 模拟…</div>}
+              {multiTrace && <section className="run-record" aria-label="多 Agent 运行记录">
+                <div className="run-summary"><span>{multiTrace.id}</span><strong className={multiTrace.status === "running" ? "" : multiTrace.status === "completed" ? "" : "error-text"}>{runStatusLabels[multiTrace.status]}</strong></div>
+                <ol className="event-list">{multiTrace.events.map((event) => <li key={event.id}>
+                  <span className={`event-icon ${event.kind === "error" ? "error-text" : ""}`}>{event.kind === "error" ? <CircleAlert size={14} /> : <Check size={14} />}</span>
+                  <div><span className="event-phase">{phaseLabels[event.phase]}</span><p>{event.message}</p>{event.metadata?.tool && <code>{String(event.metadata.tool)}</code>}</div>
+                </li>)}</ol>
+                {multiTrace.output && <div className="agent-output"><div><FileText size={14} />运行结果</div><p>{multiTrace.output}</p></div>}
+              </section>}
+            </div>
+            <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); runMulti(); }}>
+              <label className="failure-toggle"><input type="checkbox" checked={simulateFailure} disabled={busy} onChange={(event) => setSimulateFailure(event.target.checked)} />模拟工具失败</label>
+              <div className="composer-field"><textarea aria-label="任务指令" placeholder="输入任务…" value={instruction} maxLength={2000} disabled={busy} onChange={(event) => setInstruction(event.target.value)} /><div className="composer-footer"><span>{instruction.length} / 2000</span>{busy ? <button className="send-button" type="button" title="停止本次模拟" aria-label="停止本次模拟" onClick={cancel}><X size={16} /></button> : <button className="send-button" type="submit" title="运行多 Agent 模拟" aria-label="运行多 Agent 模拟" disabled={!instruction.trim()}><Send size={16} /></button>}</div></div>
+            </form>
+          </aside>
+        )}
       </div>
     </main>
   );
