@@ -13,9 +13,9 @@ import {
 } from "lucide-react";
 import { initialSnapshot, parseSnapshot, type CanvasNode, type CanvasSnapshot } from "../core/canvas.ts";
 import { runMockAgent, type MockAgentTrace } from "../core/mockAgent.ts";
-import { startRun, stepRun, decideAction } from "../core/multiAgents.ts";
+import { startRun, stepRun, decideAction, replanRun } from "../core/multiAgents.ts";
 import { LocalRunStore } from "../core/runtime/store.ts";
-import { type RunRecord, type RunTraceView} from "../core/runtime/types.ts";
+import { type RunRecord, type RunTraceView } from "../core/runtime/types.ts";
 import { isInterrupted, cancelRun } from "../core/runtime/recovery.ts";
 
 type EditorNode = Node<CanvasNode["data"], "creative">;
@@ -29,7 +29,7 @@ const store = new LocalRunStore();
 const nodeLabels = { text: "文本", image: "图像", video: "视频", reference: "参考" };
 const statusLabels = { idle: "未执行", running: "运行中", waiting: "等待中", success: "已完成", error: "失败" };
 const phaseLabels = { received: "接收", planning: "整理", tooling: "工具", validating: "校验", completed: "完成", blocked: "阻塞" };
-const runStatusLabels = { running: "执行中", awaiting_approval: "待审批", completed: "已完成", blocked: "已阻塞", cancelled: "已取消" } as const;
+const runStatusLabels = { running: "执行中", paused: "已暂停", awaiting_approval: "待审批", completed: "已完成", blocked: "已阻塞", cancelled: "已取消" } as const;
 const ROLE_LABELS = { retriever: "检索", composer: "组成", critic: "分工" } as const;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)); // 用于模拟task需要花时间执行
 const starter = structuredClone(initialSnapshot);
@@ -77,6 +77,9 @@ export default function CanvasPage() {
   const [multiTrace, setMultiTrace] = useState<RunTraceView | null>(null);
   const [boardOpen, setBoardOpen] = useState(true);
   const [pendingRecovery, setPendingRecovery] = useState<RunRecord | null>(null);
+  const [replanOpen, setReplanOpen] = useState(false);
+  const [replanInput, setReplanInput] = useState("");
+  const [replanError, setReplanError] = useState("");
   const drivingRef = useRef(false);
 
   useEffect(() => {
@@ -196,8 +199,9 @@ export default function CanvasPage() {
         if (!more) break;
         await sleep(120);
       }
-      if (run.status === "running" && cancelRef.current) { // run还在running但使用者主動中止
-        cancelRun(run, "用户中止本次执行");
+      if (run.status === "running" && cancelRef.current) {
+        // 使用者按下暫停：本輪結束後停在 paused，等他在面板上決定
+        run.status = "paused";
         await store.saveRun(run);
         applyRun(run);
       }
@@ -212,6 +216,7 @@ export default function CanvasPage() {
   const runMulti = () => { //开启新multi agent的run
     if (pendingRecovery) return; // 中断恢复需要决策，不开新run
     if (multiTrace?.pendingActions.length) return;  // 等待审批需要决策，不开新run
+    if (multiTrace?.status === "paused") return;      // 用户主动暫停中不准開新 run
     void drive(async () => {
       setMultiTrace(null);
       const runId = ((await store.getLastRunId()) ?? 0) + 1;
@@ -253,6 +258,37 @@ export default function CanvasPage() {
     }
   };
 
+  const cancelPausedRun = async () => {   // 用户决定撤销
+    if (!multiTrace) return;
+    const run = await store.getRun(multiTrace.runId);
+    if (!run) return;
+    cancelRun(run, "用户撤销本次执行");
+    await store.saveRun(run);
+    applyRun(run);
+    setReplanOpen(false);
+    setReplanError("");
+  };
+
+  const submitReplan = async () => {      // 用户提出修改需求
+    if (!multiTrace) return;
+    const run = await store.getRun(multiTrace.runId);
+    if (!run) return;
+
+    const result = replanRun(run, replanInput.trim());
+    if (!result.ok) {
+      setReplanError(result.message);
+      applyRun(run);
+      return;
+    }
+
+    setReplanOpen(false);
+    setReplanError("");
+    setReplanInput("");
+    await store.saveRun(run);
+    applyRun(run);
+    void drive(async () => run);
+  };
+
   const applyRun = (run: RunRecord) => setMultiTrace(toTrace(run));
   const toTrace = (run: RunRecord): RunTraceView => ({ // 将已有的run转化为可视化trace
     id: `MultiMock-${run.runId}`,
@@ -263,6 +299,8 @@ export default function CanvasPage() {
     tasks: run.tasks.map((t) => ({ ...t, outputRefs: [...t.outputRefs] })),
     pendingActions: run.pendingActions.map((a) => ({ ...a, payload: { ...a.payload } })),   // ← 新增
     ...(run.output ? { output: run.output } : {}),
+    approvals: [...run.approvals],
+    requirementVersion: run.requirementVersion,
   });
 
   return (
@@ -405,6 +443,41 @@ export default function CanvasPage() {
                     </div>
                   </div>
                 ))}
+              </div>
+            ) : multiTrace && multiTrace.status === "paused" ? (
+              <div className="pause-prompt" role="alertdialog" aria-label="已暂停">
+                <p>
+                  执行已暂停（第 {multiTrace.requirementVersion} 版需求，已生成{" "}
+                  {multiTrace.approvals.filter((a) => a.decision === "approved").length} 个模拟节点）。
+                </p>
+                {replanError && <p className="error-text">{replanError}</p>}
+
+                {replanOpen ? (
+                  <>
+                    <textarea
+                      className="replan-input"
+                      aria-label="新需求"
+                      placeholder="例如：改变成 4 个机位"
+                      value={replanInput}
+                      maxLength={2000}
+                      onChange={(e) => setReplanInput(e.target.value)}
+                    />
+                    <div className="recovery-actions">
+                      <button type="button" className="primary-button"
+                              disabled={!replanInput.trim()}
+                              onClick={() => void submitReplan()}>提交新需求</button>
+                      <button type="button" className="ghost-button"
+                              onClick={() => { setReplanOpen(false); setReplanError(""); }}>返回</button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="recovery-actions">
+                    <button type="button" className="primary-button"
+                            onClick={() => setReplanOpen(true)}>修改需求</button>
+                    <button type="button" className="ghost-button"
+                            onClick={() => void cancelPausedRun()}>撤销运行</button>
+                  </div>
+                )}
               </div>
             ) : (
               <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); runMulti(); }}>

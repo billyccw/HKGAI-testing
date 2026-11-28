@@ -1,4 +1,5 @@
 import { type CanvasNode, type WorkflowEdge } from "./canvas.ts";
+import { type RunRecord } from "./runtime/types.ts";
 
 type TaskStatus =
   | "pending" | "ready" | "running" | "awaiting_approval"
@@ -47,7 +48,8 @@ export type Task = {
   attempts: number; maxAttempts: number;
   outputRefs: Artifact[];      // 只有生產者寫；寫入後不可變
   workflow?: { name: string; done: boolean }[];
-  error?: string;     // ← 失敗原因
+  error?: string;     // task失敗原因
+  slot: number | null; // 为add node task记录机位
 };
 
 export type ToolContext = {
@@ -116,6 +118,9 @@ export type PlanResult =
   | { ok: true; tasks: Task[] }
   | { ok: false; code: "unsupported_intent" | "invalid_count" | "no_target"; message: string };
 
+export type ReplanResult =
+  | { ok: true; tasks: Task[] }
+  | { ok: false; message: string };
 
 export class plannerAgent extends agent {
   name = "分工Agent";
@@ -138,6 +143,7 @@ export class plannerAgent extends agent {
       targetNodeId: "brief", requirementVersion: 1,
       attempts: 0, maxAttempts: 5,
       outputRefs: [],                    // ← 取代原本的 inputRefs: [], outputRefs: []
+      slot: null,
     });
 
     const count = "一两三四五六七八九".indexOf(m[1]) + 1;
@@ -147,9 +153,65 @@ export class plannerAgent extends agent {
         targetNodeId: "brief", requirementVersion: 1,
         attempts: 0, maxAttempts: 5,
         outputRefs: [],
+        slot: i,
       });
     }
     return { ok: true, tasks };
+  };
+
+  // 接受用户暂停改变需求，目前只接受加/减多机位node数量
+  replan = (run: RunRecord, instruction: string): ReplanResult => {
+    const m = instruction.match(/(?:改[成变]|变成|改为)[\s\S]*?([一两三四五六七八九])个/);
+    if (!m) {
+      return { ok: false, message: "未能识别新需求；可接受的写法：改变成 N 个机位（N 为一到九）" };
+    }
+    const target = "一两三四五六七八九".indexOf(m[1]) + 1;
+
+    const generated = run.approvals.filter((a) => a.decision === "approved").length;
+    if (target < generated) {
+      return { ok: false, message: `无法撤销已有节点：已生成 ${generated} 个，新需求为 ${target} 个` };
+    }
+
+    const retriever = run.tasks.find((t) => t.role === "retriever");
+    const composers = run.tasks
+      .filter((t) => t.role === "composer")
+      .sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0));
+
+    // 已完成的是既成事實：保留 done、版本停在舊版
+    const done = composers.filter((t) => t.status === "done");
+    const produced = done.length;
+
+    if (target < produced) {
+      return { ok: false, message: `无法撤销已有节点：已生成 ${produced} 个，新需求为 ${target} 个` };
+    }
+
+    // 未完成的一律標 stale：它們屬於舊版本，不再執行，但保留作為被取代的紀錄
+    const stale = composers.filter((t) => t.status !== "done");
+    for (const t of stale) t.status = "stale";
+
+    // 依新需求補足；slot 接續最大值，避免重用已用過的機位號
+    let nextSlot = produced;
+    let nextId = run.tasks.reduce(
+      (max, t) => Math.max(max, Number(t.id.split("_")[1]) || 0), 0,
+    );
+    const added: Task[] = [];
+    for (let i = produced; i < target; i++) {
+      nextSlot += 1;
+      nextId += 1;
+      added.push({
+        id: `task_${nextId}`,
+        role: "composer",
+        status: "pending",
+        dependsOn: retriever ? [retriever.id] : [],
+        targetNodeId: retriever?.targetNodeId ?? null,
+        requirementVersion: run.requirementVersion + 1, //replan后版本升级
+        attempts: 0, maxAttempts: 5,
+        outputRefs: [],
+        slot: nextSlot,
+      });
+    }
+
+    return { ok: true, tasks: [...(retriever ? [retriever] : []), ...done, ...stale, ...added] };
   };
 }
 

@@ -173,3 +173,5 @@ input, textarea { min-width: 0; }
 .approval-item strong { font-size: 12px; }
 .approval-item pre { margin: 6px 0; font-size: 11px; white-space: pre-wrap; color: var(--muted); font-family: inherit; }
 .approval-item small { font-size: 10px; color: var(--muted); }
+
+/* 暂停面板UI*/

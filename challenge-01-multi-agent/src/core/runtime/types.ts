@@ -5,6 +5,7 @@ import { type CanvasNode, type WorkflowEdge } from "../canvas.ts";
 export type RunStatus =
   | "running"
   | "awaiting_approval"
+  | "paused"  
   | "completed" | "blocked" | "cancelled";
 
 export type ApprovalRecord = {
@@ -34,6 +35,8 @@ export type RunTraceView = {
   status: RunStatus;
   events: AgentEvent[];
   tasks: Task[];
-  pendingActions: PendingAction[];     // 驅動審批 UI
+  pendingActions: PendingAction[];
+  approvals: ApprovalRecord[];
   output?: string;
+  requirementVersion: number;
 };

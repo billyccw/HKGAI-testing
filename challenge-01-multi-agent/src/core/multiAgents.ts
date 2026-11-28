@@ -158,7 +158,7 @@ export async function stepRun(run: RunRecord, deps: StepDeps = {}): Promise<bool
 
   // 3) 所有任务都没有办法再推进，判断结果并返还
   if (active.length === 0) {
-    const stuck = run.tasks.find((t) => t.status !== "done");
+    const stuck = run.tasks.find((t) => t.status !== "done" && t.status !== "stale");
     if (stuck) {
       run.status = "blocked";
       const why = stuck.status === "cancelled" ? "被用户拒绝" : `状态 == ${stuck.status}`;
@@ -174,10 +174,6 @@ export async function stepRun(run: RunRecord, deps: StepDeps = {}): Promise<bool
 
   // 4) 排好這一輪各要做哪個工具（同步、順序固定）
   const plans: Plan[] = [];
-  const composerSlots = new Map(
-      run.tasks.filter((t) => t.role === "composer")
-              .map((t, i) => [t.id, i + 1] as const),
-  );
   for (const task of active) {
     const wasReady = task.status === "ready";
     task.status = "running";
@@ -208,7 +204,7 @@ export async function stepRun(run: RunRecord, deps: StepDeps = {}): Promise<bool
     plans.push({
       task, toolName: next.name, tool, inputs,
       snapshot: run.baseSnapshot,
-      slot: composerSlots.get(task.id) ?? null,
+      slot: task.slot,
     });
     emit("tooling", "tool",
       `${AGENTS[task.role].name} ${task.id} 开始 ${next.name}`,
@@ -376,6 +372,37 @@ export function decideAction(
 
   if (run.pendingActions.length === 0) run.status = "running";
   return run;
+}
+
+/**
+ * 套用新的需求（只調整 composer 數量）。
+ * 失敗時「不改動任何狀態」，由呼叫端把訊息顯示給使用者重輸。
+ */
+export function replanRun( run: RunRecord, instruction: string ): { ok: true } | { ok: false; message: string } {
+  const result = planner.replan(run, instruction);
+  if (!result.ok) return result;            // replan失敗：run 保持 paused，一個欄位都不動
+
+  run.tasks = result.tasks;
+
+  // 和startRun一样，给task派发workflow
+  for (const t of run.tasks) {
+    if (!t.workflow) t.workflow = AGENTS[t.role].createWorkflow();
+  }
+  run.requirementVersion += 1;
+  run.requirements.push({
+    version: run.requirementVersion,
+    text: instruction,
+    createdAt: "2026-01-01T00:00:00.000Z",
+  });
+
+
+  // v1 的待審批一律作廢（舊審批不得授權新工作）
+  run.pendingActions = [];
+
+  run.status = "running";
+  appendEvent(run, "planning", "stage",
+    `需求变更为第 ${run.requirementVersion} 版：${instruction}`, {});
+  return { ok: true };
 }
 
 function instructionOf(run: RunRecord): string {
