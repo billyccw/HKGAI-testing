@@ -1,7 +1,8 @@
 import { parseSnapshot } from "./canvas.ts";
-import { plannerAgent, referenceRetrievingAgent, nodeAddingAgent, type Task, TOOLS, type Tool } from "./agents.ts";
+import { plannerAgent, referenceRetrievingAgent, nodeAddingAgent, type Task, type Artifact, type Tool } from "./agents.ts";
 import { type RunStore } from "./runtime/store.ts";
 import { type RunRecord } from "./runtime/types.ts";
+
 
 export type EventPhase = "received" | "planning" | "tooling" | "validating" | "completed" | "blocked";
 export type AgentEvent = {
@@ -26,13 +27,11 @@ export type StepDeps = {
   onProgress?: (run: RunRecord) => void;
 };
 
-const ROLE_META: Record<Task["role"], {
-  name: string;
-  workflow: () => { name: string; done: boolean }[];
-}> = {
-  retriever: { name: "检索Agent", workflow: () => new referenceRetrievingAgent().createWorkflow() },
-  composer:  { name: "组成Agent", workflow: () => new nodeAddingAgent().createWorkflow() },
-  critic:    { name: "分工Agent", workflow: () => new plannerAgent().createWorkflow() },
+/** 角色 → agent 實例。實例必須完全無狀態，因為它是 module 層單例、跨 run 共用。 */
+const AGENTS: Record<Task["role"], plannerAgent | referenceRetrievingAgent | nodeAddingAgent> = {
+  retriever: new referenceRetrievingAgent(),
+  composer: new nodeAddingAgent(),
+  critic: new plannerAgent(),
 };
 
 const planner = new plannerAgent();
@@ -59,6 +58,15 @@ export function appendEvent(
 function makeEmit(run: RunRecord) {
   return (phase: EventPhase, kind: AgentEvent["kind"], message: string,
           metadata?: AgentEvent["metadata"]) => appendEvent(run, phase, kind, message, metadata);
+}
+
+/**
+ * 依 dependsOn 收集上游產物。
+ * 這是唯一的輸入來源——沒有 inputRefs，也沒有跨 task 寫入。
+ */
+function resolveInputs(run: RunRecord, task: Task): Artifact[] {
+  const byId = new Map(run.tasks.map((t) => [t.id, t]));
+  return task.dependsOn.flatMap((id) => byId.get(id)?.outputRefs ?? []);
 }
 
 /** 驗證 + 規劃 + 分配工作流，存檔後返回。不執行任何 task。 */
@@ -98,8 +106,8 @@ export async function startRun(
 
   run.tasks = result.tasks;
   for (const task of run.tasks) {
-    task.workflow = ROLE_META[task.role].workflow(); 
-    emit("planning", "stage", `${ROLE_META[task.role].name} 接受 ${task.id}`, { taskId: task.id });
+    task.workflow = AGENTS[task.role].createWorkflow();
+    emit("planning", "stage", `${AGENTS[task.role].name} 接受 ${task.id}`, { taskId: task.id });
   }
 
   if (request.simulateFailure) return fail("模拟工具失败；起步包不自动重试。");
@@ -111,7 +119,7 @@ export async function startRun(
 /** 推進一輪；耗時由呼叫的tool注入的 sleep 決定 */
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-type Plan = { task: Task; toolName: string };
+type Plan = { task: Task; toolName: string; tool: Tool; inputs: Artifact[] };
 
 export async function stepRun(run: RunRecord, deps: StepDeps = {}): Promise<boolean> {
   if (run.status !== "running") return false;
@@ -148,28 +156,46 @@ export async function stepRun(run: RunRecord, deps: StepDeps = {}): Promise<bool
     return false;
   }
 
-  // 4) 各task推進一步前先把「這一輪各要做哪個工具」排好（同步、順序固定）
+  // 4) 排好這一輪各要做哪個工具（同步、順序固定）
   const plans: Plan[] = [];
   for (const task of active) {
+    const wasReady = task.status === "ready";
     task.status = "running";
     const next = task.workflow?.find((s) => !s.done);
-    if (!next) { task.status = "done"; emit("completed", "stage", `${ROLE_META[task.role].name} 完成整个 ${task.id}`); continue; }
-    if (!(next.name in TOOLS)) {
-      task.status = "failed";
-      emit("blocked", "error", `${task.id} 请求了未授权的工具 ${next.name}`);
+    if (!next) {
+      task.status = "done";
+      emit("completed", "stage", `${AGENTS[task.role].name} 完成整个 ${task.id}`);
       continue;
     }
-    plans.push({ task, toolName: next.name });
-    emit("tooling", "tool", `${ROLE_META[task.role].name} ${task.id} 开始 ${next.name}`, { tool: next.name, attempt: 1 });
+
+    // 角色級白名單：呼叫自己沒有的工具 → 直接失敗
+    const tool = AGENTS[task.role].tools[next.name];
+    if (!tool) {
+      task.status = "failed";
+      emit("blocked", "error", `${task.id} 请求了 ${AGENTS[task.role].name} 未授权的工具 ${next.name}`);
+      continue;
+    }
+
+    // 安排task前拿好dependsOn的task的所有输出
+    const inputs = resolveInputs(run, task);
+    if ( wasReady && inputs.length > 0 ) {
+      emit("planning", "stage",
+        `${task.id} 接收 ${inputs.length} 份上游资料（${inputs.map((a) => a.artifactId).join("、")}）`,
+        { taskId: task.id });
+    }
+
+    plans.push({ task, toolName: next.name, tool, inputs });
+    emit("tooling", "tool",
+      `${AGENTS[task.role].name} ${task.id} 开始 ${next.name}`,
+      { tool: next.name, attempt: 1 });
   }
 
   // 5) 真的呼叫工具（並行重疊）,工具里面的sleep会真实耗时
-  deps.onProgress?.(run); 
+  deps.onProgress?.(run);
   const results = await Promise.all(
     plans.map(async (plan) => {
-      const tool = TOOLS[plan.toolName];
-      try {       
-        const result = await tool({ task: plan.task, sleep: sleep });
+      try {
+        const result = await plan.tool({ task: plan.task, inputs: plan.inputs, sleep });
         return { plan, ok: true as const, result };
       } catch (e) {
         return { plan, ok: false as const, message: String(e) };
@@ -177,26 +203,61 @@ export async function stepRun(run: RunRecord, deps: StepDeps = {}): Promise<bool
     }),
   );
 
+
   // 6) 依 active 順序寫回（results 的順序 = plans 的順序，可重現）
   for (const it of results) {
-    const { task, toolName } = it.plan;
+    const { task, toolName, inputs } = it.plan;
+    const agentName = AGENTS[task.role].name;
+
     if (!it.ok) {
       task.status = "failed";
       task.attempts += 1;
       emit("blocked", "error", `${task.id} 的 ${toolName} 失败：${it.message}`);
       continue;
     }
+
+    // 產物不得引用沒吃到的上游（防止工具憑空捏造來源）
+    const allowed = new Set(inputs.map((a) => a.artifactId));
+    const forged = (it.result.outputs ?? []) // 从执行结果中找出"来源不明/未授权"的 artifact（产物）引用
+      .flatMap((o) => o.derivedFrom ?? [])
+      .find((r) => r.type === "artifact" && !allowed.has(r.artifactId));
+    if (forged) {
+      task.status = "failed";
+      task.attempts += 1;
+      emit("blocked", "error", `${task.id} 的 ${toolName} 产出了引用不存在的上游资料`);
+      continue;
+    }
+
+    // 冪等寫回：id 確定性，重跑同一輪只是覆寫同一筆
+    for (const out of it.result.outputs ?? []) {
+      const artifact: Artifact = {
+        artifactId: `art-${task.id}-${out.key}`,
+        producedBy: task.id,
+        requirementVersion: task.requirementVersion,
+        content: out.content,
+        derivedFrom: out.derivedFrom ?? [],
+      };
+      const i = task.outputRefs.findIndex((a) => a.artifactId === artifact.artifactId);
+      if (i >= 0) task.outputRefs[i] = artifact;
+      else task.outputRefs.push(artifact);
+
+      emit("tooling", "tool", `${agentName} ${task.id} 产出 ${artifact.artifactId}`,
+        { tool: toolName, attempt: 1 });
+    }
+
     const step = task.workflow?.find((s) => s.name === toolName && !s.done);
     if (step) step.done = true;
-    emit("tooling", "tool", `${ROLE_META[task.role].name} ${task.id} 完成 ${toolName}`, { tool: toolName, attempt: 1 });
+
+    // 以前這裡漏掉了 summary，導致「做了什麼」看不出來
+    emit("tooling", "tool", `${agentName} ${task.id} 完成 ${toolName}：${it.result.summary}`,
+      { tool: toolName, attempt: 1 });
   }
-  deps.onProgress?.(run);
 
   // 7) 這輪跑完最後一步的 task 直接算完成
   for (const task of active) {
     if (task.status === "running" && !task.workflow?.some((s) => !s.done)) {
       task.status = "done";
-      emit("completed", "stage", `${ROLE_META[task.role].name} 完成整个 ${task.id}`);
+      emit("completed", "stage", `${AGENTS[task.role].name} 完成整个 ${task.id}`);
     }
   }
 

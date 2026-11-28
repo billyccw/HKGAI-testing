@@ -243,7 +243,7 @@ export default function CanvasPage() {
     mode: "multi-agent-mock",
     status: run.status,
     events: [...run.events],
-    tasks: run.tasks.map(t => ({ ...t })),
+    tasks: run.tasks.map((t) => ({ ...t, outputRefs: [...t.outputRefs] })),
     ...(run.output ? { output: run.output } : {}),
   });
 
@@ -292,11 +292,19 @@ export default function CanvasPage() {
             </div>
             {boardOpen && (
               <div className="task-list">
+                <div className="task-row task-head">
+                  <span>任务</span>
+                  <span>角色</span>
+                  <span>状态</span>
+                  <span>产物</span>
+                  <span>依赖</span>
+                </div>
                 {multiTrace.tasks.map((t) => (
                   <div key={t.id} className={`task-row task-${t.status}`}>
                     <code>{t.id}</code>
                     <span>{ROLE_LABELS[t.role]}</span>
                     <span className="task-status">{t.status}</span>
+                    <span className="task-out">{t.outputRefs.length || "—"}</span>
                     <span className="task-deps">{t.dependsOn.length ? `← ${t.dependsOn.join(", ")}` : "—"}</span>
                   </div>
                 ))}
