@@ -14,7 +14,8 @@ export type RunRecord = {
 export type RunTraceView = {
   id: string;
   mode: "multi-agent-mock";
-  status: "running" | "completed" | "blocked" | "cancelled"; // run 的status
+  status: "running" | "completed" | "blocked" | "cancelled";
   events: AgentEvent[];
+  tasks: Task[]; 
   output?: string;
 };

@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { initialSnapshot, parseSnapshot, type CanvasNode, type CanvasSnapshot } from "../core/canvas.ts";
 import { runMockAgent, type MockAgentTrace } from "../core/mockAgent.ts";
-import { runMultiMockAgent } from "../core/multiAgents.ts";
+import { startRun, stepRun } from "../core/multiAgents.ts";
 import { LocalRunStore } from "../core/runtime/store.ts";
 import { type RunRecord, type RunTraceView} from "../core/runtime/types.ts";
 
@@ -29,6 +29,8 @@ const nodeLabels = { text: "文本", image: "图像", video: "视频", reference
 const statusLabels = { idle: "未执行", running: "运行中", waiting: "等待中", success: "已完成", error: "失败" };
 const phaseLabels = { received: "接收", planning: "整理", tooling: "工具", validating: "校验", completed: "完成", blocked: "阻塞" };
 const runStatusLabels = { running: "执行中", completed: "已完成", blocked: "已阻塞", cancelled: "已取消",} as const;
+const ROLE_LABELS = { retriever: "检索", composer: "组成", critic: "分工" } as const;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)); // 用于模拟task需要花时间执行
 const starter = structuredClone(initialSnapshot);
 starter.projectName = "未命名创意项目";
 starter.nodes[0].data = { ...starter.nodes[0].data, title: "创意简报", textContent: "安静的摄影棚，同一主体，三个机位。保持场景与主体一致。" };
@@ -69,8 +71,10 @@ export default function CanvasPage() {
   const fileInput = useRef<HTMLInputElement>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const runSequence = useRef(0);
+  const cancelRef = useRef(false);
   const [agentMode, setAgentMode] = useState<AgentMode>("single");
   const [multiTrace, setMultiTrace] = useState<RunTraceView | null>(null);
+  const [boardOpen, setBoardOpen] = useState(true);
 
   useEffect(() => {
     try {
@@ -154,42 +158,49 @@ export default function CanvasPage() {
     timer.current = setTimeout(() => { setTrace(result); setBusy(false); timer.current = null; }, 350);
   };
   const cancel = () => {
+    cancelRef.current = true;
     if (timer.current) clearTimeout(timer.current);
     timer.current = null;
     setBusy(false);
-    setNotice(agentMode === "single" ? "已停止本次模拟展示" : "已停止本次多 Agent 模拟展示");
+    setNotice(agentMode === "single" ? "已停止本次模拟展示" : "已停止本次多 Agent 模拟");
   };
+  const applyRun = (run: RunRecord) => setMultiTrace(toTrace(run));
   const runMulti = async () => {
     if (busy) return;
-    setMultiTrace(null);
+    cancelRef.current = false;
     setBusy(true);
+    setMultiTrace(null);
     try {
-      const lastRunId = await store.getLastRunId();
-      const result = await runMultiMockAgent({
-        runId: lastRunId ? lastRunId + 1 : 1,
-        instruction,
-        snapshot: { version: 1, projectName, nodes, edges },
-        simulateFailure,
-      });
-      timer.current = setTimeout(() => {
-        setMultiTrace(toTrace(result));
-        setBusy(false);
-        timer.current = null;
-      }, 350);
+      const runId = ((await store.getLastRunId()) ?? 0) + 1;
+      const run = await startRun(
+        { runId, instruction, snapshot: { version: 1, projectName, nodes, edges }, simulateFailure },
+        store,
+      );
+      applyRun(run);
+
+      // 由page全权控制multi agent的run，这样才能透过逐个event的出现看到task之间的依赖和并行
+      while (!cancelRef.current) {
+        const more = await stepRun(run, { onProgress: applyRun });
+        await store.saveRun(run);
+        applyRun(run);
+        if (!more) break;
+        await sleep(120);
+        if (cancelRef.current) break; // 中途可能user按了暂停
+      }
     } catch {
-      setBusy(false);
       setNotice("多 Agent 模拟失败");
+    } finally {
+      setBusy(false);
     }
   };
-  const toTrace = (run: RunRecord): RunTraceView  => {
-    return {
-      id: `MultiMock-${run.runId}`,     
-      mode: "multi-agent-mock",
-      status: run.status,
-      events: run.events,
-      ...(run.output ? { output: run.output } : {}),
-    };
-  };
+  const toTrace = (run: RunRecord): RunTraceView => ({
+    id: `MultiMock-${run.runId}`,
+    mode: "multi-agent-mock",
+    status: run.status,
+    events: [...run.events],
+    tasks: run.tasks.map(t => ({ ...t })),
+    ...(run.output ? { output: run.output } : {}),
+  });
 
   return (
     <main className="workspace">
@@ -218,6 +229,36 @@ export default function CanvasPage() {
             <Controls showInteractive={false} />
           </ReactFlow>
           <div className="canvas-status"><span>{nodes.length} 个节点 · {edges.length} 条连接</span><span role="status">{notice}</span></div>
+        {agentMode === "multi" && multiTrace && multiTrace.tasks.length > 0 && (
+          <aside className={`task-float ${boardOpen ? "" : "collapsed"}`} aria-label="任务看板">
+            <div className="task-float-head">
+              <strong>任务看板</strong>
+              <small>
+                {multiTrace.tasks.filter((t) => t.status === "running").length} 运行 ·{" "}
+                {multiTrace.tasks.filter((t) => t.status === "done").length}/{multiTrace.tasks.length} 完成
+              </small>
+              <button
+                type="button"
+                onClick={() => setBoardOpen((v) => !v)}
+                aria-label={boardOpen ? "收起任务看板" : "展开任务看板"}
+              >
+                {boardOpen ? "−" : "+"}
+              </button>
+            </div>
+            {boardOpen && (
+              <div className="task-list">
+                {multiTrace.tasks.map((t) => (
+                  <div key={t.id} className={`task-row task-${t.status}`}>
+                    <code>{t.id}</code>
+                    <span>{ROLE_LABELS[t.role]}</span>
+                    <span className="task-status">{t.status}</span>
+                    <span className="task-deps">{t.dependsOn.length ? `← ${t.dependsOn.join(", ")}` : "—"}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </aside>
+        )}
         </section>
 
         {agentMode === "single" ? (

@@ -27,6 +27,16 @@ export type PlanResult =
   | { ok: true; tasks: Task[] }
   | { ok: false; code: "unsupported_intent" | "invalid_count" | "no_target"; message: string };
 
+export type ToolContext = { task: Task; sleep: (ms: number) => Promise<void> };
+export type ToolResult = { summary: string };
+export type Tool = (ctx: ToolContext) => Promise<ToolResult>;
+
+export const TOOLS: Record<string, Tool> = {
+  learn_instruction:   async ({ sleep }) => { await sleep(2000); return { summary: "已解析指令" }; },
+  get_reference:       async ({ sleep }) => { await sleep(2600); return { summary: "已取得画布参考" }; },
+  process_multi_modal: async ({ sleep }) => { await sleep(2400); return { summary: "已整理多模态输入" }; },
+  add_node:            async ({ sleep }) => { await sleep(3200); return { summary: "已写入节点草稿" }; },
+};
 
 // 这个agent负责分工
 export class plannerAgent extends agent{
@@ -39,7 +49,7 @@ export class plannerAgent extends agent{
             return { ok: false, code: "unsupported_intent", message: "未能拆分合理任务." }
         };
         if (instruction.includes(KEYWORDS[0])) {
-            const re = /创意简报[\s\S]*?拆[\s\S]*([一二三四五六七八九])个/;
+            const re = /创意简报[\s\S]*?拆[\s\S]*([一两三四五六七八九])个/;
             const m = instruction.match(re);
             if (!m) return { ok: false, code: "unsupported_intent", message: "未能拆分合理任务." };
 
@@ -48,7 +58,7 @@ export class plannerAgent extends agent{
                 {id: "task_1", role: "retriever", status: "pending", dependsOn: [], targetNodeId: "brief", requirementVersion: 1,
                     attempts:0, maxAttempts: 5, inputRefs: [], outputRefs: []}
             );
-            const count = "一二三四五六七八九".indexOf(m[1]) + 1
+            const count = "一两三四五六七八九".indexOf(m[1]) + 1
             for (let i = 1; i <= count; i++){
                 tasks.push({id: `task_${i+1}`, role: "composer", status: "pending", dependsOn: ["task_1"], targetNodeId: "brief", 
                     requirementVersion: 1, attempts:0, maxAttempts: 5, inputRefs: [], outputRefs: []}
