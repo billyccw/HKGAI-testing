@@ -38,19 +38,27 @@ const ROLE_META: Record<Task["role"], {
 const planner = new plannerAgent();
 
 // emit 直接寫進 run.events，不再需要另一個 events 陣列
+export function appendEvent(
+  run: RunRecord,
+  phase: EventPhase,
+  kind: AgentEvent["kind"],
+  message: string,
+  metadata?: AgentEvent["metadata"],
+): void {
+  run.events.push({
+    id: `${run.runId}:${run.events.length + 1}`,
+    runId: String(run.runId),
+    phase,
+    kind,
+    message,
+    createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, run.events.length)).toISOString(),
+    ...(metadata ? { metadata } : {}),
+  });
+}
+
 function makeEmit(run: RunRecord) {
   return (phase: EventPhase, kind: AgentEvent["kind"], message: string,
-          metadata?: AgentEvent["metadata"]) => {
-    run.events.push({
-      id: `${run.runId}:${run.events.length + 1}`,
-      runId: String(run.runId),
-      phase,
-      kind,
-      message,
-      createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, run.events.length)).toISOString(),
-      ...(metadata ? { metadata } : {}),
-    });
-  };
+          metadata?: AgentEvent["metadata"]) => appendEvent(run, phase, kind, message, metadata);
 }
 
 /** 驗證 + 規劃 + 分配工作流，存檔後返回。不執行任何 task。 */
@@ -106,8 +114,9 @@ const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 type Plan = { task: Task; toolName: string };
 
 export async function stepRun(run: RunRecord, deps: StepDeps = {}): Promise<boolean> {
+  if (run.status !== "running") return false;
   const maxConcurrency = deps.maxConcurrency ?? 3;
-  const sleep = deps.sleep ?? realSleep;
+  const sleep = deps.sleep ?? realSleep; // 可选注入，testing时注入deps即可跳过睡眠
   const emit = makeEmit(run);
 
   // 1) 用回合開始的快照判定 ready

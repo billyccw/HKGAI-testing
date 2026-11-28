@@ -16,6 +16,7 @@ import { runMockAgent, type MockAgentTrace } from "../core/mockAgent.ts";
 import { startRun, stepRun } from "../core/multiAgents.ts";
 import { LocalRunStore } from "../core/runtime/store.ts";
 import { type RunRecord, type RunTraceView} from "../core/runtime/types.ts";
+import { isInterrupted, cancelRun } from "../core/runtime/recovery.ts";
 
 type EditorNode = Node<CanvasNode["data"], "creative">;
 type EditorEdge = Edge;
@@ -75,6 +76,8 @@ export default function CanvasPage() {
   const [agentMode, setAgentMode] = useState<AgentMode>("single");
   const [multiTrace, setMultiTrace] = useState<RunTraceView | null>(null);
   const [boardOpen, setBoardOpen] = useState(true);
+  const [pendingRecovery, setPendingRecovery] = useState<RunRecord | null>(null);
+  const drivingRef = useRef(false);
 
   useEffect(() => {
     try {
@@ -87,13 +90,16 @@ export default function CanvasPage() {
       const nextAgent = savedAgent === "multi" ? "multi" : "single";
       if (nextAgent == "multi") setInstruction("将创意简报拆开成三个机位");
       setAgentMode(nextAgent);
-      // 开局读取run id，如果有run过就还原最后一次的run 的trace
+      // 开局读取run id，如果有run过就还原最后一次的run 的trace，如果最近一次run还是running就代表需要中断恢复
       (async () => {
         const lastRunId = await store.getLastRunId();
-        if (lastRunId) {
-          const run = await store.getRun(lastRunId);
-          setMultiTrace(run ? (toTrace(run)) : null);
+        if (lastRunId == null) return;
+        const run = await store.getRun(lastRunId);
+        if (!run) return;
+        if (isInterrupted(run)) {
+          setPendingRecovery(run);
         }
+        setMultiTrace(toTrace(run));        // 仍顯示既有事件，讓使用者看到中斷在哪
       })();
     } catch { setNotice("浏览器存储不可用，仍可导出 JSON"); }
     return () => { if (timer.current) clearTimeout(timer.current); };
@@ -158,42 +164,81 @@ export default function CanvasPage() {
     timer.current = setTimeout(() => { setTrace(result); setBusy(false); timer.current = null; }, 350);
   };
   const cancel = () => {
-    cancelRef.current = true;
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = null;
-    setBusy(false);
-    setNotice(agentMode === "single" ? "已停止本次模拟展示" : "已停止本次多 Agent 模拟");
+    cancelRef.current = true; // 设置multi agent的停止
+    if (timer.current) { // 设置单agent的停止
+      clearTimeout(timer.current);
+      timer.current = null;
+      setBusy(false);
+      setNotice("已停止本次模拟展示");
+      return;
+    }
   };
-  const applyRun = (run: RunRecord) => setMultiTrace(toTrace(run));
-  const runMulti = async () => {
-    if (busy) return;
+
+  /**
+   * 由page全权控制multi agent的run，这样才能透过逐个event的出现看到task之间的依赖和并行
+   * 唯一的推進迴圈。新 run 與續跑共用，差別只在傳進來的 start()。
+   * busy / 取消 / 落盤 / UI 更新集中在這裡，避免兩份迴圈各自演化。
+   */
+
+  const drive = async (start: () => Promise<RunRecord>) => {
+    if (drivingRef.current) return;
+    drivingRef.current = true;
     cancelRef.current = false;
     setBusy(true);
-    setMultiTrace(null);
     try {
-      const runId = ((await store.getLastRunId()) ?? 0) + 1;
-      const run = await startRun(
-        { runId, instruction, snapshot: { version: 1, projectName, nodes, edges }, simulateFailure },
-        store,
-      );
+      const run = await start();
       applyRun(run);
-
-      // 由page全权控制multi agent的run，这样才能透过逐个event的出现看到task之间的依赖和并行
+      if (run.status !== "running") return;
       while (!cancelRef.current) {
         const more = await stepRun(run, { onProgress: applyRun });
-        await store.saveRun(run);
+        await store.saveRun(run);        // 唯一的落盤點：輪邊界
         applyRun(run);
         if (!more) break;
         await sleep(120);
-        if (cancelRef.current) break; // 中途可能user按了暂停
+      }
+      if (run.status === "running" && cancelRef.current) { // run还在running但使用者主動中止
+        cancelRun(run, "用户中止本次执行");
+        await store.saveRun(run);
+        applyRun(run);
       }
     } catch {
       setNotice("多 Agent 模拟失败");
     } finally {
+      drivingRef.current = false;
       setBusy(false);
     }
   };
-  const toTrace = (run: RunRecord): RunTraceView => ({
+
+  const runMulti = () => { //开启新multi agent的run
+    if (pendingRecovery) return;
+    void drive(async () => {
+      setMultiTrace(null);
+      const runId = ((await store.getLastRunId()) ?? 0) + 1;
+      return startRun(
+        { runId, instruction, snapshot: { version: 1, projectName, nodes, edges }, simulateFailure },
+        store,
+      );
+    });
+  };
+
+  const resumeRun = () => { // 恢复已有被中断的run
+    const run = pendingRecovery;
+    if (!run) return;
+    setPendingRecovery(null);
+    void drive(async () => run); 
+  };
+
+  const discardRun = async () => { // 撤销已有被中断的run
+    const run = pendingRecovery;
+    if (!run) return;
+    cancelRun(run, "检测到执行中断；用户放弃恢复"); 
+    await store.saveRun(run);   
+    applyRun(run);          // 展示被取消的run的trace
+    setPendingRecovery(null);
+  };
+
+  const applyRun = (run: RunRecord) => setMultiTrace(toTrace(run));
+  const toTrace = (run: RunRecord): RunTraceView => ({ // 将已有的run转化为可视化trace
     id: `MultiMock-${run.runId}`,
     mode: "multi-agent-mock",
     status: run.status,
@@ -271,7 +316,7 @@ export default function CanvasPage() {
               {!trace && !busy && <div className="empty-run"><Layers3 size={32} strokeWidth={1} /><span>暂无运行记录</span></div>}
               {busy && <div className="running-state" role="status"><LoaderCircle size={18} className="spinning" />正在执行本地模拟…</div>}
               {trace && <section className="run-record" aria-label="运行记录">
-                <div className="run-summary"><span>{trace.id}</span><strong className={trace.status === "blocked" ? "error-text" : ""}>{trace.status === "completed" ? "已完成" : "已阻塞"}</strong></div>
+                <div className="run-summary"><span>{trace.id}</span><strong className={trace.status === "blocked" ? "error-text" : ""}>{trace.status === "completed" ? "已完成" : "已阻塞"}</strong></div>                
                 <ol className="event-list">{trace.events.map((event) => <li key={event.id}>
                   <span className={`event-icon ${event.kind === "error" ? "error-text" : ""}`}>{event.kind === "error" ? <CircleAlert size={14} /> : <Check size={14} />}</span>
                   <div><span className="event-phase">{phaseLabels[event.phase]}</span><p>{event.message}</p>{event.metadata?.tool && <code>{String(event.metadata.tool)}</code>}</div>
@@ -294,7 +339,12 @@ export default function CanvasPage() {
               {!multiTrace && !busy && <div className="empty-run"><Layers3 size={32} strokeWidth={1} /><span>暂无运行记录</span></div>}
               {busy && <div className="running-state" role="status"><LoaderCircle size={18} className="spinning" />正在执行多 Agent 模拟…</div>}
               {multiTrace && <section className="run-record" aria-label="多 Agent 运行记录">
-                <div className="run-summary"><span>{multiTrace.id}</span><strong className={multiTrace.status === "running" ? "" : multiTrace.status === "completed" ? "" : "error-text"}>{runStatusLabels[multiTrace.status]}</strong></div>
+                <div className="run-summary">
+                  <span>{multiTrace.id}</span>
+                  <strong className={pendingRecovery || multiTrace.status === "blocked" ? "error-text" : ""}>
+                    {pendingRecovery ? "已中断（待决定）" : runStatusLabels[multiTrace.status]}
+                  </strong>
+                </div>
                 <ol className="event-list">{multiTrace.events.map((event) => <li key={event.id}>
                   <span className={`event-icon ${event.kind === "error" ? "error-text" : ""}`}>{event.kind === "error" ? <CircleAlert size={14} /> : <Check size={14} />}</span>
                   <div><span className="event-phase">{phaseLabels[event.phase]}</span><p>{event.message}</p>{event.metadata?.tool && <code>{String(event.metadata.tool)}</code>}</div>
@@ -302,10 +352,25 @@ export default function CanvasPage() {
                 {multiTrace.output && <div className="agent-output"><div><FileText size={14} />运行结果</div><p>{multiTrace.output}</p></div>}
               </section>}
             </div>
-            <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); runMulti(); }}>
-              <label className="failure-toggle"><input type="checkbox" checked={simulateFailure} disabled={busy} onChange={(event) => setSimulateFailure(event.target.checked)} />模拟工具失败</label>
-              <div className="composer-field"><textarea aria-label="任务指令" placeholder="输入任务…" value={instruction} maxLength={2000} disabled={busy} onChange={(event) => setInstruction(event.target.value)} /><div className="composer-footer"><span>{instruction.length} / 2000</span>{busy ? <button className="send-button" type="button" title="停止本次模拟" aria-label="停止本次模拟" onClick={cancel}><X size={16} /></button> : <button className="send-button" type="submit" title="运行多 Agent 模拟" aria-label="运行多 Agent 模拟" disabled={!instruction.trim()}><Send size={16} /></button>}</div></div>
-            </form>
+            {pendingRecovery ? (
+              <div className="recovery-prompt" role="alertdialog" aria-label="恢复上一次执行">
+                <p>检测到上一次执行意外中断（{toTrace(pendingRecovery).id}）。</p>
+                <p>
+                  已完成 {pendingRecovery.tasks.filter((t) => t.status === "done").length} 个任务，
+                  还有 {pendingRecovery.tasks.filter((t) => t.status !== "done").length} 个未完成。
+                  要继续执行，还是放弃并取消剩余任务？
+                </p>
+                <div className="recovery-actions">
+                  <button type="button" className="primary-button" onClick={resumeRun}>继续执行</button>
+                  <button type="button" className="ghost-button" onClick={() => void discardRun()}>放弃本次</button>
+                </div>
+              </div>
+            ) : (
+              <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); runMulti(); }}>
+                <label className="failure-toggle"><input type="checkbox" checked={simulateFailure} disabled={busy} onChange={(event) => setSimulateFailure(event.target.checked)} />模拟工具失败</label>
+                <div className="composer-field"><textarea aria-label="任务指令" placeholder="输入任务…" value={instruction} maxLength={2000} disabled={busy} onChange={(event) => setInstruction(event.target.value)} /><div className="composer-footer"><span>{instruction.length} / 2000</span>{busy ? <button className="send-button" type="button" title="停止本次模拟" aria-label="停止本次模拟" onClick={cancel}><X size={16} /></button> : <button className="send-button" type="submit" title="运行多 Agent 模拟" aria-label="运行多 Agent 模拟" disabled={!instruction.trim()}><Send size={16} /></button>}</div></div>
+              </form>
+            )}
           </aside>
         )}
       </div>

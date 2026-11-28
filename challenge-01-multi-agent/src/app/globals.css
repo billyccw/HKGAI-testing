@@ -113,7 +113,13 @@ input, textarea { min-width: 0; }
 .task-status { font-weight: 600; }
 .task-row.task-running .task-status { color: #d97706; }
 .task-row.task-done .task-status { color: #16a34a; }
-.task-row.task-blocked .task-status { color: #dc2626; }
+.task-row.task-cancelled .task-status { color: var(--error); }
+.task-row.task-cancelled { opacity: .6; }
+.task-row.task-pending .task-status,
+.task-row.task-ready .task-status { color: var(--muted); }
+.task-row.task-failed .task-status,
+.task-row.task-blocked .task-status { color: var(--error); }
+.task-row.task-stale .task-status { color: #d97706; }
 .task-deps { opacity: .6; font-size: 11px; }
 .task-float {
   position: absolute;
@@ -144,3 +150,16 @@ input, textarea { min-width: 0; }
 }
 .task-float-head button:hover { background: var(--hover); color: var(--text); }
 .task-float .task-list { margin: 0; padding: 6px 8px 8px; }
+
+/* 中斷恢復提示 */
+.recovery-prompt { padding: 14px 16px 18px; border-top: 1px solid var(--line); }
+.recovery-prompt p { margin: 0 0 6px; font-size: 12px; line-height: 1.7; color: var(--muted); }
+.recovery-prompt p:first-child { color: var(--text); font-weight: 500; }
+.recovery-actions { display: flex; gap: 8px; margin-top: 12px; }
+.recovery-actions > button { flex: 1; }
+.ghost-button {
+  height: 35px; border-radius: 6px; border: 1px solid var(--line);
+  background: transparent; color: var(--text); font-size: 12px;
+}
+.ghost-button:hover { background: var(--hover); }
+.task-float.interrupted { border-color: #d97706; }
