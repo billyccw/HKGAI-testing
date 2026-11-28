@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { initialSnapshot, parseSnapshot, type CanvasNode, type CanvasSnapshot } from "../core/canvas.ts";
 import { runMockAgent, type MockAgentTrace } from "../core/mockAgent.ts";
-import { startRun, stepRun } from "../core/multiAgents.ts";
+import { startRun, stepRun, decideAction } from "../core/multiAgents.ts";
 import { LocalRunStore } from "../core/runtime/store.ts";
 import { type RunRecord, type RunTraceView} from "../core/runtime/types.ts";
 import { isInterrupted, cancelRun } from "../core/runtime/recovery.ts";
@@ -29,7 +29,7 @@ const store = new LocalRunStore();
 const nodeLabels = { text: "文本", image: "图像", video: "视频", reference: "参考" };
 const statusLabels = { idle: "未执行", running: "运行中", waiting: "等待中", success: "已完成", error: "失败" };
 const phaseLabels = { received: "接收", planning: "整理", tooling: "工具", validating: "校验", completed: "完成", blocked: "阻塞" };
-const runStatusLabels = { running: "执行中", completed: "已完成", blocked: "已阻塞", cancelled: "已取消",} as const;
+const runStatusLabels = { running: "执行中", awaiting_approval: "待审批", completed: "已完成", blocked: "已阻塞", cancelled: "已取消" } as const;
 const ROLE_LABELS = { retriever: "检索", composer: "组成", critic: "分工" } as const;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)); // 用于模拟task需要花时间执行
 const starter = structuredClone(initialSnapshot);
@@ -210,7 +210,8 @@ export default function CanvasPage() {
   };
 
   const runMulti = () => { //开启新multi agent的run
-    if (pendingRecovery) return;
+    if (pendingRecovery) return; // 中断恢复需要决策，不开新run
+    if (multiTrace?.pendingActions.length) return;  // 等待审批需要决策，不开新run
     void drive(async () => {
       setMultiTrace(null);
       const runId = ((await store.getLastRunId()) ?? 0) + 1;
@@ -237,13 +238,30 @@ export default function CanvasPage() {
     setPendingRecovery(null);
   };
 
+  const decide = async (actionId: string, decision: "approved" | "rejected") => { // 用户决定是否approve修改
+    if (!multiTrace) return;
+    const run = await store.getRun(multiTrace.runId);     // 重新讀，避免與 UI 快照不同步
+    if (!run) return;
+
+    decideAction(run, actionId, decision);
+    await store.saveRun(run);
+    applyRun(run);
+
+    // 全部決策完且 run 回到 running → 繼續推進
+    if (run.pendingActions.length === 0 && run.status === "running") {
+      void drive(async () => run);
+    }
+  };
+
   const applyRun = (run: RunRecord) => setMultiTrace(toTrace(run));
   const toTrace = (run: RunRecord): RunTraceView => ({ // 将已有的run转化为可视化trace
     id: `MultiMock-${run.runId}`,
+    runId: run.runId,
     mode: "multi-agent-mock",
     status: run.status,
     events: [...run.events],
     tasks: run.tasks.map((t) => ({ ...t, outputRefs: [...t.outputRefs] })),
+    pendingActions: run.pendingActions.map((a) => ({ ...a, payload: { ...a.payload } })),   // ← 新增
     ...(run.output ? { output: run.output } : {}),
   });
 
@@ -372,6 +390,21 @@ export default function CanvasPage() {
                   <button type="button" className="primary-button" onClick={resumeRun}>继续执行</button>
                   <button type="button" className="ghost-button" onClick={() => void discardRun()}>放弃本次</button>
                 </div>
+              </div>
+            ) : multiTrace && multiTrace.pendingActions.length > 0 ? (
+              <div className="approval-prompt" role="alertdialog" aria-label="待审批变更">
+                <p>以下变更需要你批准（<b>模拟执行，不会修改画布</b>）：</p>
+                {multiTrace.pendingActions.map((a) => (
+                  <div key={a.actionId} className="approval-item">
+                    <strong>{a.payload.title}</strong>
+                    <pre>{a.payload.textContent}</pre>
+                    <small>模拟连接自节点 {a.payload.title}</small>
+                    <div className="recovery-actions">
+                      <button type="button" className="primary-button" onClick={() => void decide(a.actionId, "approved")}>允许</button>
+                      <button type="button" className="ghost-button" onClick={() => void decide(a.actionId, "rejected")}>拒绝</button>
+                    </div>
+                  </div>
+                ))}
               </div>
             ) : (
               <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); runMulti(); }}>

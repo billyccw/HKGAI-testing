@@ -1,3 +1,4 @@
+import { type CanvasNode, type WorkflowEdge } from "./canvas.ts";
 
 type TaskStatus =
   | "pending" | "ready" | "running" | "awaiting_approval"
@@ -8,10 +9,10 @@ type TaskStatus =
  * document = 來自專案文件庫（RAG），必帶版本號
  * artifact = 來自本 run 內某個上游任務的產物
  */
-export type ArtifactRef =
+export type ArtifactRef = 
   | { type: "document"; sourceId: string; docVersion: number }
-  | { type: "artifact"; artifactId: string };
-
+  | { type: "artifact"; artifactId: string }
+  | { type: "node"; nodeId: string }; // artifact可以来自画布节点
 /**
  * 產物。刻意不設 kind：
  * 「是不是 evidence」由 derivedFrom 是否含 document 推導，不再另外存一個可能漂移的標籤。
@@ -24,21 +25,36 @@ export type Artifact = {
   derivedFrom: ArtifactRef[];  // 一律要交代來源
 };
 
+// 待审批动作，具体需要审批的是创建节点并连线（add_node）
+export type PendingAction = {
+  actionId: string;
+  taskId: string;
+  requirementVersion: number;
+  payload: {
+    title: string;
+    textContent: string;
+    connectFrom: string;
+  };
+};
+
 export type Task = {
   id: string;
   role: "retriever" | "composer" | "critic";
   status: TaskStatus;
-  dependsOn: string[];         // 順序約束 + 資料來源（已合流）
+  dependsOn: string[];
   targetNodeId: string | null;
   requirementVersion: number;
   attempts: number; maxAttempts: number;
   outputRefs: Artifact[];      // 只有生產者寫；寫入後不可變
   workflow?: { name: string; done: boolean }[];
+  error?: string;     // ← 失敗原因
 };
 
 export type ToolContext = {
   task: Task;
   inputs: Artifact[];                              // ← 由 stepRun 依 dependsOn 解析好
+  snapshot: { nodes: CanvasNode[]; edges: WorkflowEdge[] };   // ← 新增：唯讀畫布
+  slot: number | null;
   sleep: (ms: number) => Promise<void>;
 };
 
@@ -51,9 +67,38 @@ export type ToolOutput = {
 export type ToolResult = {
   summary: string;
   outputs?: ToolOutput[];
+  proposes?: PendingAction;      // ← 新增：提出審批請求
 };
 
 export type Tool = (ctx: ToolContext) => Promise<ToolResult>;
+
+function findBrief(snapshot: ToolContext["snapshot"]) {
+  const brief = snapshot.nodes.find((n) => n.data.title.trim() === "创意简报");
+  if (!brief) {
+    const titles = snapshot.nodes.map((n) => n.data.title).join("、") || "（画布为空）";
+    throw new Error(`画布上找不到标题为「创意简报」的节点；现有节点：${titles}`);
+  }
+  return brief;
+}
+
+function findReferences(snapshot: ToolContext["snapshot"], briefId: string) {
+  const linkedIds = snapshot.edges
+    .filter((e) => e.source === briefId || e.target === briefId)
+    .map((e) => (e.source === briefId ? e.target : e.source));
+
+  const refs = snapshot.nodes.filter(
+    (n) => linkedIds.includes(n.id) && n.data.nodeType === "reference",
+  );
+  if (refs.length === 0) {
+    throw new Error("画布上找不到与「创意简报」相连的参考节点；请先连接一个节点类型为「参考」的节点");
+  }
+  return refs;
+}
+
+/** 把上游 artifact 的內容拼成參考描述 */
+function referenceText(inputs: Artifact[]): string {
+  return inputs.map((a) => a.content.trim()).filter(Boolean).join("\n");
+}
 
 /**
  * 角色契約。stepRun 只認識 Task.role（字串），
@@ -120,24 +165,27 @@ export class referenceRetrievingAgent extends agent {
   }
 
   tools: Record<string, Tool> = {
-    // 檢索任務沒有上游：明確表達「無輸入」是正常狀態，不是失敗
     learn_instruction: async (ctx) => {
       await ctx.sleep(2000);
-      if (ctx.inputs.length > 0) {
-        throw new Error("检索任务不应收到上游资料");
-      }
-      return { summary: "已解析指令；检索任务无上游输入" };
+      const brief = findBrief(ctx.snapshot);
+      const refs = findReferences(ctx.snapshot, brief.id);
+      return { summary: `已解析指令；定位到「${brief.data.title}」与 ${refs.length} 个参考节点` };
     },
 
-    // 產出 evidence：derivedFrom 指向文件庫的一筆文件
+    // 產出 artifact：內容是參考節點的描述，來源記為畫布節點
     get_reference: async (ctx) => {
       await ctx.sleep(2600);
+      const brief = findBrief(ctx.snapshot);
+      const refs = findReferences(ctx.snapshot, brief.id);
       return {
-        summary: "已取得画布参考（模拟来源：sample-reference v1）",
+        summary: `已取得 ${refs.length} 个参考节点的描述`,
         outputs: [{
           key: "reference",
-          content: "白模构图参考：同一主体、三个机位、保持空间关系。",
-          derivedFrom: [{ type: "document", sourceId: "sample-reference", docVersion: 1 }],
+          content: refs.map((r) => r.data.textContent.trim()).filter(Boolean).join("\n"),
+          derivedFrom: [
+            { type: "node" as const, nodeId: brief.id },
+            ...refs.map((r) => ({ type: "node" as const, nodeId: r.id })),
+          ],
         }],
       };
     },
@@ -156,36 +204,48 @@ export class nodeAddingAgent extends agent {
     ];
   }
 
-  tools: Record<string, Tool> = {
-    // 與檢索版相反：拿不到上游資料就拒絕執行
+   tools: Record<string, Tool> = {
+    // 拿不到上游資料就拒絕執行
     learn_instruction: async (ctx) => {
       await ctx.sleep(2000);
-      if (ctx.inputs.length === 0) {
-        throw new Error("未收到上游资料，拒绝继续");
-      }
+      if (ctx.inputs.length === 0) throw new Error("未收到上游资料，拒绝继续");
       return { summary: `已解析指令；载入 ${ctx.inputs.length} 份上游资料` };
     },
 
-    // 消化輸入，並在摘要裡列出引用來源（讓交接在事件流上可見）
+    // 這一步「產出草稿」——把參考节点的文本描述變成自己的 artifact
     process_multi_modal: async (ctx) => {
       await ctx.sleep(2400);
-      if (ctx.inputs.length === 0) {
-        throw new Error("无可整理的多模态输入");
-      }
-      const ids = ctx.inputs.map(a => a.artifactId).join("、");
-      return { summary: `已整理多模态输入（引用 ${ids}）` };
-    },
-
-    // 產出 draft：derivedFrom 指回它吃到的 artifact
-    add_node: async (ctx) => {
-      await ctx.sleep(3200);
+      const text = referenceText(ctx.inputs);
+      if (!text) throw new Error("上游资料中没有任何参考描述");
       return {
-        summary: "已写入节点草稿",
+        summary: `已整理参考描述（${text.length} 字）`,
         outputs: [{
           key: "draft",
-          content: `基于 ${ctx.inputs.length} 份参考生成的节点草稿`,
-          derivedFrom: ctx.inputs.map(a => ({ type: "artifact" as const, artifactId: a.artifactId })),
+          content: `参考描述：${text}`,
+          derivedFrom: ctx.inputs.map((a) => ({ type: "artifact" as const, artifactId: a.artifactId })),
         }],
+      };
+    },
+
+    // 這一步只提案，不寫畫布、不寫 outputRefs，等审批通过
+    add_node: async (ctx) => {
+      await ctx.sleep(3200);
+      const brief = findBrief(ctx.snapshot);       // 只為了取 connectFrom
+      const slot = ctx.slot ?? 1;
+      const text = referenceText(ctx.inputs);
+
+      return {
+        summary: `准备新建「机位 ${slot}」（需审批）`,
+        proposes: {
+          actionId: `act-${ctx.task.id}-add_node`,
+          taskId: ctx.task.id,
+          requirementVersion: ctx.task.requirementVersion,
+          payload: {
+            title: `机位 ${slot}`,
+            textContent: `机位 ${slot}\n参考描述：${text}`,
+            connectFrom: brief.id,
+          },
+        },
       };
     },
   };
