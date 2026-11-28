@@ -5,7 +5,29 @@ export interface RunStore {
   saveRun(r: RunRecord): Promise<void>;
 }
 
-// export class MemoryRunStore implements RunStore {}  未处理，之后设立测试做
+//測試用的 in-memory store，储存JSON而不是localStorage
+export class MemoryRunStore implements RunStore {
+  private runs = new Map<number, string>();
+  private order: number[] = [];
+
+  async getRunIdList(): Promise<number[]> {
+    return [...this.order];
+  }
+
+  async getLastRunId(): Promise<number | null> {
+    return this.order.at(-1) ?? null;
+  }
+
+  async getRun(runId: number): Promise<RunRecord | null> {
+    const raw = this.runs.get(runId);
+    return raw ? (JSON.parse(raw) as RunRecord) : null;
+  }
+
+  async saveRun(r: RunRecord): Promise<void> {
+    this.runs.set(r.runId, JSON.stringify(r));
+    if (!this.order.includes(r.runId)) this.order.push(r.runId);
+  }
+}
 
 export class LocalRunStore implements RunStore {
   static runIdListKey = "mindverse:runtime:runIdList";
